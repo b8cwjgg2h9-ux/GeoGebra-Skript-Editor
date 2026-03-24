@@ -1,0 +1,506 @@
+<!DOCTYPE html>
+<html lang="de">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>GeoGebra Skript-IDE</title>
+
+    <script src="https://cdn.geogebra.org/apps/deployggb.js"></script>
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.65.13/codemirror.min.css">
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.65.13/codemirror.min.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.65.13/mode/javascript/javascript.min.js"></script>
+
+    <style>
+        body {
+            margin: 0;
+            padding: 0;
+            display: flex;
+            flex-direction: column;
+            min-height: 100vh;
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+        }
+
+        #ggb-container {
+            height: 55vh;
+            min-height: 450px;
+            border-bottom: 2px solid #ccc;
+            flex-shrink: 0;
+        }
+
+        #script-container {
+            padding: 20px;
+            background: #f8f9fa;
+            display: flex;
+            flex-direction: column;
+            flex-grow: 1;
+        }
+
+        #controls {
+            display: flex;
+            gap: 10px;
+            margin-bottom: 10px;
+            flex-wrap: wrap;
+        }
+
+        button {
+            padding: 10px 20px;
+            font-size: 14px;
+            cursor: pointer;
+            background: #0066cc;
+            color: white;
+            border: none;
+            border-radius: 4px;
+            font-weight: bold;
+        }
+
+        button:hover {
+            background: #0052a3;
+        }
+
+        button.clear-btn {
+            background: #6c757d;
+        }
+
+        button.clear-btn:hover {
+            background: #5a6268;
+        }
+
+        .CodeMirror {
+            border: 1px solid #ced4da;
+            border-radius: 4px;
+            font-family: 'Courier New', Courier, monospace;
+            font-size: 15px;
+            margin-bottom: 10px;
+            height: auto;
+            flex-grow: 1;
+        }
+
+        #error-log {
+            color: #842029;
+            background: #f8d7da;
+            padding: 15px;
+            border: 1px solid #f5c2c7;
+            border-radius: 4px;
+            display: none;
+            font-family: monospace;
+            white-space: pre-wrap;
+            margin-top: 10px;
+        }
+
+        .syntax-suggestion {
+            color: #055160;
+            background: #cff4fc;
+            padding: 10px;
+            border-left: 4px solid #0dcaf0;
+            margin-top: 5px;
+            font-size: 13px;
+        }
+    </style>
+</head>
+
+<body>
+
+    <div id="ggb-container"></div>
+
+    <div id="script-container">
+        <div id="controls">
+            <button onclick="executeScript()">Skript ausführen</button>
+            <button id="app-toggle-btn" class="clear-btn" onclick="toggleGeoGebraApp()">Zu Classic wechseln</button>
+            <button class="clear-btn" onclick="clearScript()">Skript löschen</button>
+            <button class="clear-btn" onclick="clearGeoGebra()">GeoGebra leeren</button>
+            <span id="dict-status"
+                style="line-height: 40px; margin-left: auto; color: #666; font-size: 13px;">Wörterbuch lädt...</span>
+        </div>
+
+        <textarea id="script-input">
+A=Punkt({(0,0)})  
+B=Punkt({(3,0)}) 
+C=(2,2)          
+V=Vieleck[A,B,C] 
+ZeigeAchsen(1,false)
+Winkel(A,C,B)
+
+# Eigenschaften des Dreiecks:
+SetzeFarbe(V,rot) 
+SetzeBeschriftung(C,"Bewege mich!")
+Liste={a,b,c}    
+Ausführen( Folge("ShowLabel(" + Name(Element(Liste, i)) + ", false)", i, 1, Length(Liste)) ) 
+        </textarea>
+
+        <div id="error-log"></div>
+    </div>
+
+    <script>
+        var ggbApplet;
+        var editor;
+
+        var commandDict = {};
+        var germanCommands = [];
+        var germanToEnglish = {};
+        var commandRegexCache = {};
+
+        var currentCommandFailed = false;
+        var currentGeoGebraApp = "suite";
+        var applet;
+
+        window.myGeoGebraErrorHandler = function () {
+            currentCommandFailed = true;
+        };
+
+        window.onload = function () {
+            editor = CodeMirror.fromTextArea(document.getElementById("script-input"), {
+                lineNumbers: true,
+                mode: "javascript",
+                theme: "default",
+                matchBrackets: true
+            });
+
+            loadDictionary();
+            injectGeoGebraApp();
+        };
+
+        function getAppletHeight() {
+            return Math.max(window.innerHeight * 0.55, 450);
+        }
+
+        function createAppletParameters(appName) {
+            return {
+                "appName": appName,
+                "width": window.innerWidth,
+                "height": getAppletHeight(),
+                "showToolBar": true,
+                "showAlgebraInput": true,
+                "showMenuBar": true,
+                "language": "de",
+                "useBrowserForJS": false,
+                "errorDialogsActive": false,
+                "appletOnLoad": function (api) {
+                    ggbApplet = api;
+                    window.onresize = function () {
+                        api.setSize(window.innerWidth, getAppletHeight());
+                    };
+                }
+            };
+        }
+
+        function updateAppToggleButton() {
+            var button = document.getElementById("app-toggle-btn");
+            if (!button) return;
+            button.textContent = currentGeoGebraApp === "suite"
+                ? "Zu Classic wechseln"
+                : "Zu Suite wechseln";
+        }
+
+        function injectGeoGebraApp() {
+            ggbApplet = null;
+            currentCommandFailed = false;
+            document.getElementById("ggb-container").outerHTML = '<div id="ggb-container"></div>';
+            applet = new GGBApplet(createAppletParameters(currentGeoGebraApp), true);
+            applet.inject("ggb-container");
+            updateAppToggleButton();
+        }
+
+        function toggleGeoGebraApp() {
+            currentGeoGebraApp = currentGeoGebraApp === "suite" ? "classic" : "suite";
+            document.getElementById("error-log").style.display = "none";
+            injectGeoGebraApp();
+        }
+
+        async function loadDictionary() {
+            try {
+                const response = await fetch('command_de.json');
+                if (!response.ok) {
+                    throw new Error("HTTP " + response.status);
+                }
+                const text = await response.text();
+                parseProperties(text);
+                document.getElementById('dict-status').innerHTML = "Wörterbuch geladen (" + germanCommands.length + " Befehle)";
+            } catch (error) {
+                document.getElementById('dict-status').innerHTML = "<span style='color:red;'>Fehler: command_de.json nicht gefunden! Bitte über lokalen Server ausführen.</span>";
+            }
+        }
+
+        function parseProperties(text) {
+            const lines = text.split('\n');
+            let map = {};
+
+            for (let line of lines) {
+                line = line.trim();
+                if (!line || line.startsWith('#')) continue;
+                const eqIdx = line.indexOf('=');
+                if (eqIdx > -1) {
+                    const key = line.substring(0, eqIdx).trim();
+                    const val = line.substring(eqIdx + 1).replace(/\\n/g, '\n').trim();
+                    map[key] = val;
+                }
+            }
+
+            for (let key in map) {
+                if (!key.includes('.')) {
+                    const englishCmd = key;
+                    const germanCmd = map[key];
+
+                    germanToEnglish[germanCmd] = englishCmd;
+                    if (!germanCommands.includes(germanCmd)) {
+                        germanCommands.push(germanCmd);
+                    }
+
+                    const syntax = map[englishCmd + '.Syntax'] || map[englishCmd + '.SyntaxCAS'];
+                    if (syntax) {
+                        commandDict[germanCmd.toLowerCase()] = {
+                            german: germanCmd,
+                            syntax: syntax.split('\n')
+                        };
+                    }
+                }
+            }
+            germanCommands.sort((a, b) => b.length - a.length);
+
+            for (let deCmd of germanCommands) {
+                commandRegexCache[deCmd] = new RegExp("(^|[^a-zA-ZäöüÄÖÜß_])(" + deCmd + ")(?=\\s*[\\[\\(])", "g");
+            }
+        }
+
+        function translateLineToEnglish(line) {
+            let strings = [];
+            let tempLine = line.replace(/"([^"\\]*(\\.[^"\\]*)*)"/g, function (match) {
+                strings.push(match);
+                return '"__STR_' + (strings.length - 1) + '__"';
+            });
+
+            for (let deCmd of germanCommands) {
+                let engCmd = germanToEnglish[deCmd];
+                let regex = commandRegexCache[deCmd];
+                tempLine = tempLine.replace(regex, "$1" + engCmd);
+            }
+
+            for (let i = 0; i < strings.length; i++) {
+                tempLine = tempLine.replace('"__STR_' + i + '__"', strings[i]);
+            }
+
+            return tempLine;
+        }
+
+        function isEscaped(text, index) {
+            let backslashCount = 0;
+            for (let i = index - 1; i >= 0 && text[i] === '\\'; i--) {
+                backslashCount++;
+            }
+            return backslashCount % 2 === 1;
+        }
+
+        function escapeHtml(text) {
+            return text
+                .replace(/&/g, "&amp;")
+                .replace(/</g, "&lt;")
+                .replace(/>/g, "&gt;")
+                .replace(/"/g, "&quot;")
+                .replace(/'/g, "&#39;");
+        }
+
+        function stripComments(line) {
+            let inString = false;
+            for (let i = 0; i < line.length; i++) {
+                if (line[i] === '"' && !isEscaped(line, i)) inString = !inString;
+                if (!inString) {
+                    if (line[i] === '#') return line.substring(0, i).trim();
+                    if (i < line.length - 1 && line[i] === '/' && line[i + 1] === '/') {
+                        return line.substring(0, i).trim();
+                    }
+                }
+            }
+            return line.trim();
+        }
+
+        function getLevenshteinDistance(a, b) {
+            const matrix = [];
+            for (let i = 0; i <= b.length; i++) { matrix[i] = [i]; }
+            for (let j = 0; j <= a.length; j++) { matrix[0][j] = j; }
+            for (let i = 1; i <= b.length; i++) {
+                for (let j = 1; j <= a.length; j++) {
+                    if (b.charAt(i - 1) == a.charAt(j - 1)) {
+                        matrix[i][j] = matrix[i - 1][j - 1];
+                    } else {
+                        matrix[i][j] = Math.min(matrix[i - 1][j - 1] + 1, Math.min(matrix[i][j - 1] + 1, matrix[i - 1][j] + 1));
+                    }
+                }
+            }
+            return matrix[b.length][a.length];
+        }
+
+        function findBestMatches(inputCmd) {
+            let matches = [];
+            let lowerInput = inputCmd.toLowerCase();
+            for (let cmd of germanCommands) {
+                let lowerCmd = cmd.toLowerCase();
+                let dist = getLevenshteinDistance(lowerInput, lowerCmd);
+                if (dist <= 3 || lowerCmd.includes(lowerInput)) {
+                    matches.push({ cmd: cmd, dist: dist });
+                }
+            }
+            matches.sort((a, b) => a.dist - b.dist);
+            return matches.slice(0, 3);
+        }
+
+        function extractCommandName(line) {
+            let match = line.match(/(?:=\s*)?([A-Za-zÄÖÜäöüß]+)\s*[[(]/);
+            return match ? match[1] : null;
+        }
+
+        function getAllArguments(cmdString) {
+            let start = cmdString.search(/[[(]/);
+            let end = Math.max(cmdString.lastIndexOf(')'), cmdString.lastIndexOf(']'));
+            if (start === -1 || end === -1 || end <= start) return [];
+
+            let argsString = cmdString.substring(start + 1, end);
+            let args = [];
+            let pCount = 0;
+            let currentArg = "";
+            let inString = false;
+
+            for (let i = 0; i < argsString.length; i++) {
+                let char = argsString[i];
+                if (char === '"' && !isEscaped(argsString, i)) inString = !inString;
+
+                if (!inString) {
+                    if (char === '(' || char === '[' || char === '{') pCount++;
+                    else if (char === ')' || char === ']' || char === '}') pCount--;
+                    else if (char === ',' && pCount === 0) {
+                        if (currentArg.trim() !== "") args.push(currentArg.trim());
+                        currentArg = "";
+                        continue;
+                    }
+                }
+                currentArg += char;
+            }
+            if (currentArg.trim() !== "") {
+                args.push(currentArg.trim());
+            }
+            return args;
+        }
+
+        function executeScript() {
+            var script = editor.getValue();
+            var errorLog = document.getElementById("error-log");
+            errorLog.style.display = "none";
+            errorLog.innerHTML = "";
+
+            if (typeof ggbApplet === "undefined" || !ggbApplet) {
+                alert("GeoGebra lädt noch. Bitte einen Moment Geduld.");
+                return;
+            }
+
+            const scriptingCmds = [
+                "CenterView", "Delete", "Execute", "GetTime", "Pan", "ParseToFunction", "ParseToNumber",
+                "PlaySound", "Rename", "RunClickScript", "RunUpdateScript", "SelectObjects", "SetActiveView",
+                "SetBackgroundColor", "SetCaption", "SetColor", "SetConditionToShowObject", "SetConstructionStep",
+                "SetCoords", "SetDynamicColor", "SetFilling", "SetFixed", "SetLabelMode", "SetLayer", "SetLineStyle",
+                "SetLineThickness", "SetPerspective", "SetPointSize", "SetPointStyle", "SetSeed", "SetSpinSpeed",
+                "SetTooltipMode", "SetTrace", "SetValue", "SetViewDirection", "SetVisibleInView", "ShowAxes",
+                "ShowGrid", "ShowLabel", "ShowLayer", "StartAnimation", "StartLogging", "StartRecord",
+                "StopLogging", "UpdateConstruction", "ZoomIn", "ZoomOut", "Repeat"
+            ];
+
+            const ignorableConstants = [
+                "true", "false", "pi", "e", "i", "x", "y", "z",
+                "rot", "red", "grün", "green", "blau", "blue", "gelb", "yellow",
+                "orange", "lila", "purple", "purpur", "cyan", "magenta",
+                "schwarz", "black", "weiß", "weiss", "white", "grau", "gray",
+                "grey", "braun", "brown", "pink", "rosa"
+            ];
+
+            var lines = script.split('\n');
+            var errorsHtml = "";
+
+            ggbApplet.setRepaintingActive(false);
+            try {
+                for (var i = 0; i < lines.length; i++) {
+                    var line = stripComments(lines[i]);
+                    if (line.length === 0) continue;
+
+                    var translatedLine = translateLineToEnglish(line);
+                    let cmdMatch = translatedLine.match(/(?:=\s*)?([A-Za-z]+)\s*[[(]/);
+                    let engCmd = cmdMatch ? cmdMatch[1] : null;
+                    let isScriptingCmd = engCmd && scriptingCmds.includes(engCmd);
+
+                    let args = isScriptingCmd ? getAllArguments(translatedLine) : [];
+                    let variablesToCheck = [];
+
+                    for (let arg of args) {
+                        let isWord = /^[A-Za-zÄÖÜäöüß][A-Za-z0-9ÄÖÜäöüß_]*$/.test(arg);
+                        let isKnownConstant = ignorableConstants.includes(arg.toLowerCase());
+
+                        if (isWord && !isKnownConstant) {
+                            variablesToCheck.push({
+                                name: arg,
+                                existedBefore: ggbApplet.exists(arg)
+                            });
+                        }
+                    }
+
+                    currentCommandFailed = false;
+                    var success = ggbApplet.evalCommand(translatedLine);
+
+                    let missingObjectError = false;
+                    for (let v of variablesToCheck) {
+                        let existsAfter = ggbApplet.exists(v.name);
+                        if (!v.existedBefore && !existsAfter) {
+                            missingObjectError = true;
+                            break;
+                        }
+                    }
+
+                    if (currentCommandFailed || missingObjectError || (!success && !isScriptingCmd)) {
+                        errorsHtml += `<strong>Fehler in Zeile ${i + 1}:</strong> <code>${escapeHtml(lines[i].trim())}</code><br>`;
+
+                        let originalCmdMatch = extractCommandName(line);
+                        if (originalCmdMatch && germanCommands.length > 0) {
+                            let suggestions = findBestMatches(originalCmdMatch);
+
+                            if (suggestions.length > 0) {
+                                errorsHtml += `<div class="syntax-suggestion"><strong>Meintest du vielleicht:</strong><br>`;
+                                suggestions.forEach(s => {
+                                    if (commandDict[s.cmd.toLowerCase()]) {
+                                        let syntaxInfo = commandDict[s.cmd.toLowerCase()].syntax;
+                                        errorsHtml += `<br><b>${escapeHtml(s.cmd)}</b><br>`;
+                                        syntaxInfo.forEach(vari => {
+                                            errorsHtml += `↳ ${escapeHtml(s.cmd)}${escapeHtml(vari)}<br>`;
+                                        });
+                                    }
+                                });
+                                errorsHtml += `</div>`;
+                            } else {
+                                errorsHtml += `<div class="syntax-suggestion">Objekt existiert nicht, Kontextfehler oder unbekannter Befehl im aktuellen Modus.</div>`;
+                            }
+                        } else {
+                            errorsHtml += `<div class="syntax-suggestion">Mathematischer Fehler oder unbekanntes Objekt.</div>`;
+                        }
+                        errorsHtml += "<hr style='border: 0; border-bottom: 1px solid #f5c2c7; margin: 15px 0;'>";
+                    }
+                }
+            } finally {
+                ggbApplet.setRepaintingActive(true);
+            }
+
+            if (errorsHtml !== "") {
+                errorLog.innerHTML = errorsHtml;
+                errorLog.style.display = "block";
+            }
+        }
+
+        function clearScript() {
+            editor.setValue("");
+            document.getElementById("error-log").style.display = "none";
+        }
+
+        function clearGeoGebra() {
+            if (typeof ggbApplet !== "undefined" && ggbApplet) {
+                ggbApplet.newConstruction();
+                document.getElementById("error-log").style.display = "none";
+            }
+        }
+    </script>
+</body>
+
+</html>
