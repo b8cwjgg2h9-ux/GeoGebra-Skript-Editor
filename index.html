@@ -138,6 +138,9 @@ Ausführen( Folge("ShowLabel(" + Name(Element(Liste, i)) + ", false)", i, 1, Len
         var commandDict = {};
         var germanCommands = [];
         var germanToEnglish = {};
+        // Alle Befehlsnamen (englisch und deutsch, klein geschrieben) – auch die, deren deutscher
+        // Name mit dem englischen übereinstimmt und daher keine eigene Übersetzungszeile hat.
+        var allCommandNames = new Set();
         var commandRegexCache = {};
 
         var currentCommandFailed = false;
@@ -177,6 +180,9 @@ Ausführen( Folge("ShowLabel(" + Name(Element(Liste, i)) + ", false)", i, 1, Len
                 "errorDialogsActive": false,
                 "appletOnLoad": function (api) {
                     ggbApplet = api;
+                    // CAS vorwärmen: Die erste CAS-Rechnung nach dem Laden liefert sonst
+                    // falsche Ergebnisse (z. B. leere Lösungsmenge bei Löse).
+                    try { api.evalCommandCAS("1+1"); } catch (e) { }
                     window.onresize = function () {
                         api.setSize(window.innerWidth, getAppletHeight());
                     };
@@ -237,7 +243,9 @@ Ausführen( Folge("ShowLabel(" + Name(Element(Liste, i)) + ", false)", i, 1, Len
             }
 
             for (let key in map) {
+                allCommandNames.add(key.split('.')[0].toLowerCase());
                 if (!key.includes('.')) {
+                    allCommandNames.add(map[key].toLowerCase());
                     const englishCmd = key;
                     const germanCmd = map[key];
 
@@ -380,8 +388,22 @@ Ausführen( Folge("ShowLabel(" + Name(Element(Liste, i)) + ", false)", i, 1, Len
             return args;
         }
 
-        function executeScript() {
+        async function waitForCas() {
+            // Wartet höchstens 10 s, bis das CAS rechnet.
+            for (let ms = 0; ms < 10000; ms += 250) {
+                try { if (ggbApplet.evalCommandCAS("1+1") === "2") return true; } catch (e) { }
+                await new Promise(r => setTimeout(r, 250));
+            }
+            return false;
+        }
+
+        async function executeScript() {
             var script = editor.getValue();
+            if (typeof ggbApplet !== "undefined" && ggbApplet &&
+                (currentGeoGebraApp === "classic" || /^\s*\$\d+\s*:/m.test(script))) {
+                await waitForCas();
+            }
+            var casInfos = [];
             var errorLog = document.getElementById("error-log");
             errorLog.style.display = "none";
             errorLog.innerHTML = "";
@@ -439,8 +461,27 @@ Ausführen( Folge("ShowLabel(" + Name(Element(Liste, i)) + ", false)", i, 1, Len
                         }
                     }
 
+                    // CAS-Zellen werden nur angezeigt, wenn die CAS-Ansicht schon offen ist,
+                    // bevor sie angelegt werden. Deshalb vor jeder $-Zeile öffnen.
+                    if (currentGeoGebraApp === "classic" && /^\s*\$\d+\s*:/.test(translatedLine)) {
+                        if (ensureCasView()) casInfos.push("CAS-Ansicht wurde geöffnet.");
+                    }
+
                     currentCommandFailed = false;
+                    var objectsBefore = ggbApplet.getObjectNumber();
                     var success = ggbApplet.evalCommand(translatedLine);
+                    var objectsCreated = ggbApplet.getObjectNumber() > objectsBefore;
+
+                    // CAS-Zeilen ($n: ...) erzeugen nicht immer ein Algebra-Objekt; evalCommand
+                    // liefert dafuer immer false. Erfolg wird an der Ausgabe der CAS-Zelle gemessen.
+                    let casMatch = translatedLine.match(/^\s*\$(\d+)\s*:/);
+                    let casMessage = "";
+                    if (casMatch) {
+                        let casCheck = checkCasCell(parseInt(casMatch[1], 10), translatedLine);
+                        success = casCheck.ok;
+                        casMessage = casCheck.message;
+                        currentCommandFailed = !casCheck.ok;
+                    }
 
                     let missingObjectError = false;
                     for (let v of variablesToCheck) {
@@ -451,8 +492,40 @@ Ausführen( Folge("ShowLabel(" + Name(Element(Liste, i)) + ", false)", i, 1, Len
                         }
                     }
 
+                    // Automatische CAS-Umleitung (nur Classic): Eine Zeile ohne $, die in der
+                    // Algebra-Eingabe scheitert oder ihr Objekt nicht anlegt, wird als CAS-Zelle
+                    // gerechnet – z. B. Löse mit Parametern, Ersetze, Wendepunkt bei e-Funktionen.
+                    if (!casMatch && !isScriptingCmd && currentGeoGebraApp === "classic") {
+                        const target = assignmentTarget(translatedLine);
+                        // Gescheitert, oder ohne jedes neue Objekt (z. B. Wendepunkt bei e-Funktionen).
+                        // Mehrfachergebnisse wie N=Nullstelle(f) legen N_1, N_2 an – das gilt als Erfolg.
+                        const missed = !success || currentCommandFailed ||
+                            (target && !ggbApplet.exists(target.name) && !objectsCreated);
+                        if (missed && !unknownName(target ? target.rhs : translatedLine)) {
+                            const routed = routeToCas(translatedLine, target, casInfos);
+                            if (routed.ok) {
+                                success = true;
+                                currentCommandFailed = false;
+                                missingObjectError = false;
+                                let note = "";
+                                if (target && !ggbApplet.exists(target.name)) {
+                                    note = " – bleibt im CAS, weil freie Parameter vorkommen";
+                                }
+                                casInfos.push(`Zeile ${i + 1} → CAS-Zelle $${routed.row}: <code>${escapeHtml(lines[i].trim())}</code>${note}`);
+                            } else if (routed.message) {
+                                casMessage = routed.message;
+                                currentCommandFailed = true;
+                            }
+                        }
+                    }
+
                     if (currentCommandFailed || missingObjectError || (!success && !isScriptingCmd)) {
                         errorsHtml += `<strong>Fehler in Zeile ${i + 1}:</strong> <code>${escapeHtml(lines[i].trim())}</code><br>`;
+                        if (casMessage) {
+                            errorsHtml += `<div class="syntax-suggestion">${escapeHtml(casMessage)}</div>`;
+                            errorsHtml += "<hr style='border: 0; border-bottom: 1px solid #f5c2c7; margin: 15px 0;'>";
+                            continue;
+                        }
 
                         let originalCmdMatch = extractCommandName(line);
                         if (originalCmdMatch && germanCommands.length > 0) {
@@ -487,6 +560,144 @@ Ausführen( Folge("ShowLabel(" + Name(Element(Liste, i)) + ", false)", i, 1, Len
                 errorLog.innerHTML = errorsHtml;
                 errorLog.style.display = "block";
             }
+            showCasInfo(casInfos);
+        }
+
+        function showCasInfo(infos) {
+            let box = document.getElementById("cas-info");
+            if (!box) {
+                box = document.createElement("div");
+                box.id = "cas-info";
+                box.style.cssText = "display:none;margin:10px 0;padding:10px 14px;border:1px solid #9ec5fe;" +
+                    "background:#e7f1ff;color:#052c65;border-radius:6px;font-size:14px;line-height:1.5";
+                const log = document.getElementById("error-log");
+                log.parentNode.insertBefore(box, log.nextSibling);
+            }
+            if (!infos || infos.length === 0) {
+                box.style.display = "none";
+                box.innerHTML = "";
+                return;
+            }
+            box.innerHTML = "<strong>Im CAS gerechnet</strong> (die Algebra-Eingabe kann diese Zeilen nicht rechnen):<br>" +
+                infos.join("<br>");
+            box.style.display = "block";
+        }
+
+        function assignmentTarget(line) {
+            // name = … oder name(x, …) = … ; x, y, z sind Gleichungen, keine Zuweisungen
+            const m = line.match(/^\s*([A-Za-z][A-Za-z0-9]*(?:_\{[^}]*\}|_[A-Za-z0-9]+)?)\s*(\([^()]*\))?\s*=(?!=)\s*(.+)$/);
+            if (!m || ["x", "y", "z"].includes(m[1])) return null;
+            return { name: m[1], args: m[2] || "", rhs: m[3] };
+        }
+
+        function casCells() {
+            return [...ggbApplet.getXML().matchAll(/<cascell[\s\S]*?<\/cascell>/g)].map(m => m[0]);
+        }
+
+        function unknownName(expr) {
+            // Liefert den ersten Namen vor "(", der weder Befehl noch Funktion noch definiert ist.
+            const builtins = ["sin", "cos", "tan", "cot", "sec", "csc", "arcsin", "arccos", "arctan", "asin", "acos", "atan",
+                "sinh", "cosh", "tanh", "exp", "ln", "log", "lg", "ld", "sqrt", "cbrt", "nroot", "abs", "sgn", "sign",
+                "floor", "ceil", "round", "random", "gamma", "beta", "erf", "real", "imaginary", "conjugate", "arg",
+                "x", "y", "z", "fractionalPart"];
+            const defined = new Set(casCells().map(c => ((c.match(/<inputCell>\s*<expression value="\s*([A-Za-z][A-Za-z0-9_{}]*)\s*\([^"]*:=/) || [])[1])).filter(Boolean));
+            const names = [...expr.matchAll(/([A-Za-zÄÖÜäöüß][A-Za-z0-9ÄÖÜäöüß_]*)\s*\(/g)].map(m => m[1]);
+            for (const n of names) {
+                const ok = allCommandNames.has(n.toLowerCase()) || builtins.includes(n) || ggbApplet.exists(n) || defined.has(n);
+                if (!ok) return n;
+            }
+            return null;
+        }
+
+        function ensureCasView() {
+            // Öffnet die CAS-Ansicht (Kürzel C) zusätzlich zu den offenen Ansichten.
+            // Rückgabe true, wenn sie gerade erst geöffnet wurde.
+            let xml = "";
+            try { xml = ggbApplet.getPerspectiveXML(); } catch (e) { return false; }
+            const visible = [...xml.matchAll(/<view id="(\d+)"[^>]*visible="true"/g)].map(m => m[1]);
+            if (visible.includes("8")) return false;
+            const letters = { "1": "G", "2": "A", "4": "S", "16": "D", "32": "L", "64": "B", "512": "T" };
+            const current = visible.map(id => letters[id] || "").join("");
+            ggbApplet.setPerspective((current || "AG") + "C");
+            return true;
+        }
+
+        function casRowForLabel(name) {
+            // Zeilennummer einer vorhandenen CAS-Zelle mit diesem Namen, sonst 0.
+            const cells = casCells();
+            for (let k = 0; k < cells.length; k++) {
+                const label = (cells[k].match(/caslabel="([^"]*)"/) || [])[1];
+                if (label === name) return k + 1;
+            }
+            return 0;
+        }
+
+        function routeToCas(translatedLine, target, casInfos) {
+            const rhs = target ? target.rhs : translatedLine.trim();
+            let probe;
+            try { probe = String(ggbApplet.evalCommandCAS(rhs) || "").trim(); } catch (e) { probe = ""; }
+            if (probe === "" || probe === "?" || /NaN/.test(probe) || /Überprüfen|Fehler|error/i.test(probe)) {
+                return { ok: false, message: "" };
+            }
+            if (/^\{\s*\}$/.test(probe)) {
+                return { ok: false, message: "Auch im CAS ergibt sich die leere Menge {} – Ansatz prüfen (Tippfehler, Parameter e, zu viele oder zu wenige Bedingungen)." };
+            }
+            let input = rhs;
+            if (target) {
+                let lhs = target.name + target.args;
+                // Ein Ausdruck in x wird als Funktion zugewiesen, damit er gezeichnet wird.
+                const isExprInX = !target.args && /(^|[^A-Za-z_])x([^A-Za-z_(]|$)/.test(probe) &&
+                    !/^[{(]/.test(probe) && !probe.includes("=");
+                if (isExprInX) lhs = target.name + "(x)";
+                input = lhs + ":=" + rhs;
+                if (ggbApplet.exists(target.name)) ggbApplet.deleteObject(target.name);
+            }
+            if (ensureCasView() && casInfos) casInfos.push("CAS-Ansicht wurde geöffnet.");
+            // Gibt es schon eine CAS-Zelle mit diesem Namen (z. B. beim zweiten Ausführen),
+            // wird sie überschrieben statt eine neue anzulegen – sonst benennt GeoGebra um.
+            const row = (target && casRowForLabel(target.name)) || casCells().length + 1;
+            const casLine = "$" + row + ": " + input;
+            ggbApplet.evalCommand(casLine);
+            const check = checkCasCell(row, casLine);
+            return { ok: check.ok, message: check.message, row: row, input: input };
+        }
+
+        function checkCasCell(row, translatedLine) {
+            // Liest die CAS-Zelle Nummer row aus dem Konstruktions-XML und bewertet ihre Ausgabe.
+            const xml = ggbApplet.getXML();
+            const cells = [...xml.matchAll(/<cascell[\s\S]*?<\/cascell>/g)].map(m => m[0]);
+            if (row < 1 || row > cells.length) {
+                return { ok: false, message: `CAS-Zelle $${row} wurde nicht angelegt. Zellen lückenlos ab $1 nummerieren.` };
+            }
+            const cell = cells[row - 1];
+            const out = cell.match(/<outputCell>\s*<expression value="([^"]*)"([^>]*)>/);
+            if (!out) {
+                return { ok: false, message: "CAS-Zelle ohne Ergebnis – Syntaxfehler (z. B. fehlende Klammer)." };
+            }
+            const value = out[1].trim();
+            const result = value.includes(":=") ? value.split(":=").slice(1).join(":=").trim() : value;
+            if (/error="true"/.test(out[2]) || result === "" || result === "?" || /NaN/.test(result)) {
+                return { ok: false, message: `CAS-Zelle liefert keinen gültigen Wert (${result || "leer"}).` };
+            }
+            if (/^\{\s*\}$/.test(result)) {
+                return { ok: false, message: "CAS-Zelle liefert die leere Menge {} – Ansatz prüfen (Tippfehler, Parameter e, zu viele oder zu wenige Bedingungen)." };
+            }
+            // Unbekannte Befehle meldet das CAS nicht als Fehler, sondern gibt sie unverändert
+            // oder als Produkt zurück (Foo(3) -> Foo * 3). Deshalb jeden Namen vor "(" prüfen.
+            const body = translatedLine.replace(/^\s*\$\d+\s*:/, "");
+            const rhs = body.includes(":=") ? body.split(":=").slice(1).join(":=") : body;
+            const unknown = unknownName(rhs);
+            if (unknown) {
+                return { ok: false, message: `„${unknown}“ ist weder ein GeoGebra-Befehl noch eine definierte Funktion. Das CAS meldet das nicht selbst, das Ergebnis ist unbrauchbar.` };
+            }
+            if (/:=/.test(body) && /^\s*[A-Za-z]/.test(body)) {
+                const label = (cell.match(/caslabel="([^"]*)"/) || [])[1];
+                const wanted = body.split(":=")[0].replace(/\(.*$/, "").trim();
+                if (label && wanted && label !== wanted) {
+                    return { ok: false, message: `Name „${wanted}“ ist schon vergeben; das CAS hat die Zuweisung in „${label}“ umbenannt.` };
+                }
+            }
+            return { ok: true, message: "" };
         }
 
         function clearScript() {
@@ -498,6 +709,7 @@ Ausführen( Folge("ShowLabel(" + Name(Element(Liste, i)) + ", false)", i, 1, Len
             if (typeof ggbApplet !== "undefined" && ggbApplet) {
                 ggbApplet.newConstruction();
                 document.getElementById("error-log").style.display = "none";
+                showCasInfo([]);
             }
         }
     </script>
