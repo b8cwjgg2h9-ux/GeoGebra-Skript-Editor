@@ -433,6 +433,8 @@ Ausführen( Folge("ShowLabel(" + Name(Element(Liste, i)) + ", false)", i, 1, Len
             ];
 
             var lines = script.split('\n');
+            // Namen, die schon vor dem Skript existierten (z. B. beim zweiten Ausführen).
+            const namesAtStart = new Set(ggbApplet.getAllObjectNames());
             var errorsHtml = "";
 
             ggbApplet.setRepaintingActive(false);
@@ -468,6 +470,18 @@ Ausführen( Folge("ShowLabel(" + Name(Element(Liste, i)) + ", false)", i, 1, Len
                     }
 
                     currentCommandFailed = false;
+                    const lineTarget = assignmentTarget(translatedLine);
+                    const targetExistedBefore = !!(lineTarget && ggbApplet.exists(lineTarget.name));
+                    // GeoGebra löscht beim Versuch, ein abhängiges Objekt neu zu definieren, unter Umständen das
+                    // Objekt, zu dem es gehört (G=(3,3,3) nach Würfel(A,B,C) löscht den Würfel). Solche Zeilen
+                    // werden deshalb gar nicht erst ausgeführt, wenn der Name erst in diesem Skript entstanden ist.
+                    if (targetExistedBefore && !namesAtStart.has(lineTarget.name) &&
+                        !ggbApplet.isIndependent(lineTarget.name) && !casRowForLabel(lineTarget.name)) {
+                        errorsHtml += `<strong>Fehler in Zeile ${i + 1}:</strong> <code>${escapeHtml(lines[i].trim())}</code><br>`;
+                        errorsHtml += `<div class="syntax-suggestion">${escapeHtml(nameClashMessage(lineTarget.name))}</div>`;
+                        errorsHtml += "<hr style='border: 0; border-bottom: 1px solid #f5c2c7; margin: 15px 0;'>";
+                        continue;
+                    }
                     var objectsBefore = ggbApplet.getObjectNumber();
                     var success = ggbApplet.evalCommand(translatedLine);
                     var objectsCreated = ggbApplet.getObjectNumber() > objectsBefore;
@@ -501,7 +515,13 @@ Ausführen( Folge("ShowLabel(" + Name(Element(Liste, i)) + ", false)", i, 1, Len
                         // Mehrfachergebnisse wie N=Nullstelle(f) legen N_1, N_2 an – das gilt als Erfolg.
                         const missed = !success || currentCommandFailed ||
                             (target && !ggbApplet.exists(target.name) && !objectsCreated);
-                        if (missed && !unknownName(target ? target.rhs : translatedLine)) {
+                        // Namenskonflikt: Der Name wurde weiter oben im Skript schon vergeben, oft automatisch
+                        // (Ecken eines Würfels, Seiten eines Vielecks). Nicht ins CAS umleiten und nichts löschen.
+                        const nameClash = missed && target && targetExistedBefore && !namesAtStart.has(target.name);
+                        if (nameClash) {
+                            casMessage = nameClashMessage(target.name);
+                            currentCommandFailed = true;
+                        } else if (missed && !unknownName(target ? target.rhs : translatedLine)) {
                             const routed = routeToCas(translatedLine, target, casInfos);
                             if (routed.ok) {
                                 success = true;
@@ -632,6 +652,22 @@ Ausführen( Folge("ShowLabel(" + Name(Element(Liste, i)) + ", false)", i, 1, Len
             return 0;
         }
 
+        function nameClashMessage(name) {
+            return `Der Name ${name} ist schon vergeben – vermutlich hat ein Befehl weiter oben ihn automatisch angelegt ` +
+                `(z. B. die Ecken eines Würfels oder die Seiten eines Vielecks). Einen anderen Namen wählen ` +
+                `oder das vorhandene Objekt direkt verwenden.`;
+        }
+
+        function functionVariable(probe, target) {
+            // Ist das CAS-Ergebnis ein Ausdruck in genau einer freien Variablen (x, t, s, …),
+            // wird es als Funktion dieser Variablen zugewiesen, damit es gezeichnet wird.
+            if (!target || target.args || /^[{(]/.test(probe) || probe.includes("=")) return null;
+            if (/(^|[^A-Za-z_])x([^A-Za-z_(]|$)/.test(probe)) return "x";
+            const letters = [...probe.matchAll(/(?:^|[^A-Za-z_])([a-df-hj-wA-Z])(?=[^A-Za-z_(]|$)/g)].map(m => m[1]);
+            const free = [...new Set(letters)].filter(v => !ggbApplet.exists(v));
+            return free.length === 1 ? free[0] : null;
+        }
+
         function routeToCas(translatedLine, target, casInfos) {
             const rhs = target ? target.rhs : translatedLine.trim();
             let probe;
@@ -646,11 +682,17 @@ Ausführen( Folge("ShowLabel(" + Name(Element(Liste, i)) + ", false)", i, 1, Len
             if (target) {
                 let lhs = target.name + target.args;
                 // Ein Ausdruck in x wird als Funktion zugewiesen, damit er gezeichnet wird.
-                const isExprInX = !target.args && /(^|[^A-Za-z_])x([^A-Za-z_(]|$)/.test(probe) &&
-                    !/^[{(]/.test(probe) && !probe.includes("=");
-                if (isExprInX) lhs = target.name + "(x)";
+                const fvar = functionVariable(probe, target);
+                if (fvar) lhs = target.name + "(" + fvar + ")";
                 input = lhs + ":=" + rhs;
-                if (ggbApplet.exists(target.name)) ggbApplet.deleteObject(target.name);
+                if (ggbApplet.exists(target.name)) {
+                    // Nur eigene Objekte ersetzen: ein abhängiges Objekt (z. B. die Ecke G eines Würfels)
+                    // zu löschen, würde das Objekt, zu dem es gehört, mitlöschen.
+                    if (!casRowForLabel(target.name) && !ggbApplet.isIndependent(target.name)) {
+                        return { ok: false, message: nameClashMessage(target.name) };
+                    }
+                    ggbApplet.deleteObject(target.name);
+                }
             }
             if (ensureCasView() && casInfos) casInfos.push("CAS-Ansicht wurde geöffnet.");
             // Gibt es schon eine CAS-Zelle mit diesem Namen (z. B. beim zweiten Ausführen),
